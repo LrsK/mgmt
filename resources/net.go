@@ -36,16 +36,8 @@
 package resources
 
 import (
-	"bytes"
-	"crypto/sha256"
 	"encoding/gob"
-	"encoding/hex"
-	"fmt"
-	"io"
 	"log"
-	"os"
-	"path"
-	"strings"
 	"time"
 
 	"github.com/purpleidea/mgmt/event"
@@ -61,7 +53,7 @@ func init() {
 
 // Sections in .network files
 
-// The [MATCH] section provides a way to match an interface on which to
+// The match section provides a way to match an interface on which to set settings
 type MatchSection struct {
 	MACAddress        *string  `yaml:"mac_address"`         // The hardware address of the interface e.g., 01:23:45:67:89:ab
 	Path              []string `yaml:"path"`                // Globs matching the persistent path, as exposed by the udev property "ID_PATH".
@@ -140,20 +132,21 @@ type BridgeVLANSection struct {
 // NetRes is a systemd-networkd resource.
 type NetRes struct {
 	BaseRes    `yaml:",inline"`
-	Match      MatchSection      `yaml:"match"`
-	Link       LinkSection       `yaml:"link"`
-	Address    AddressSection    `yaml:"address"`
-	Route      RouteSection      `yaml:"route"`
-	DHCP       DHCPSection       `yaml:"dhcp"`
-	IPv6       IPv6Section       `yaml:"ipv6"`
-	DHCPServer DHCPServerSection `yaml:"dhcp_server"`
-	Bridge     BridgeSection     `yaml:"bridge"`
-	BridgeFDB  BridgeFDBSection  `yaml:"bridge_fdb"`
-	BridgeVLAN BridgeVLANSection `yaml:"bridge_vlan"`
-	State      string            `yaml:"state"` // state: exists/present?, absent, (undefined?)
-	Force      bool              `yaml:"force"`
-	configDir  string            // dir containing networkd config files (/etc/systemd/network/)
-	path       string            // path to .network config file
+	Match      MatchSection         `yaml:"match"`
+	Link       LinkSection          `yaml:"link"`
+	Address    AddressSection       `yaml:"address"`
+	Route      RouteSection         `yaml:"route"`
+	DHCP       DHCPSection          `yaml:"dhcp"`
+	IPv6       IPv6Section          `yaml:"ipv6"`
+	DHCPServer DHCPServerSection    `yaml:"dhcp_server"`
+	Bridge     BridgeSection        `yaml:"bridge"`
+	BridgeFDB  BridgeFDBSection     `yaml:"bridge_fdb"`
+	BridgeVLAN BridgeVLANSection    `yaml:"bridge_vlan"`
+	State      string               `yaml:"state"` // state: exists/present?, absent, (undefined?)
+	Force      bool                 `yaml:"force"`
+	configDir  string               // dir containing networkd config files (/etc/systemd/network/)
+	path       string               // path to .network config file
+	recWatcher *recwatch.RecWatcher // watcher for config files
 }
 
 // NewNetRes is a constructor for this resource. It also calls Init() for you.
@@ -184,11 +177,9 @@ func (obj *NetRes) Validate() error {
 }
 
 // Watch is the primary listener for this resource and it outputs events.
-// This one is a file watcher for files and directories.
-// Modify with caution, it is probably important to write some test cases first!
+// This one is a file watcher for netword config files.
 // If the Watch returns an error, it means that something has gone wrong, and it
 // must be restarted. On a clean exit it returns nil.
-// FIXME: Also watch the source directory when using obj.Source !!!
 func (obj *NetRes) Watch(processChan chan event.Event) error {
 	if obj.IsWatching() {
 		return nil // TODO: should this be an error?
@@ -208,7 +199,7 @@ func (obj *NetRes) Watch(processChan chan event.Event) error {
 	}
 
 	var err error
-	obj.recWatcher, err = recwatch.NewRecWatcher(obj.Path, obj.Recurse)
+	obj.recWatcher, err = recwatch.NewRecWatcher(obj.path, false)
 	if err != nil {
 		return err
 	}
@@ -272,338 +263,6 @@ func (obj *NetRes) Watch(processChan chan event.Event) error {
 	}
 }
 
-// fileCheckApply is the CheckApply operation for a source and destination file.
-// It can accept an io.Reader as the source, which can be a regular file, or it
-// can be a bytes Buffer struct. It can take an input sha256 hash to use instead
-// of computing the source data hash, and it returns the computed value if this
-// function reaches that stage. As usual, it respects the apply action variable,
-// and it symmetry with the main CheckApply function returns checkOK and error.
-func (obj *NetRes) fileCheckApply(apply bool, src io.ReadSeeker, dst string, sha256sum string) (string, bool, error) {
-	// TODO: does it make sense to switch dst to an io.Writer ?
-	// TODO: use obj.Force when dealing with symlinks and other file types!
-	if obj.debug {
-		log.Printf("fileCheckApply: %s -> %s", src, dst)
-	}
-
-	srcFile, isFile := src.(*os.File)
-	_, isBytes := src.(*bytes.Reader) // supports seeking!
-	if !isFile && !isBytes {
-		return "", false, fmt.Errorf("Can't open src as either file or buffer!")
-	}
-
-	var srcStat os.FileInfo
-	if isFile {
-		var err error
-		srcStat, err = srcFile.Stat()
-		if err != nil {
-			return "", false, err
-		}
-		// TODO: deal with symlinks
-		if !srcStat.Mode().IsRegular() { // can't copy non-regular files or dirs
-			return "", false, fmt.Errorf("Non-regular src file: %s (%q)", srcStat.Name(), srcStat.Mode())
-		}
-	}
-
-	dstFile, err := os.Open(dst)
-	if err != nil && !os.IsNotExist(err) { // ignore ErrNotExist errors
-		return "", false, err
-	}
-	dstClose := func() error {
-		return dstFile.Close() // calling this twice is safe :)
-	}
-	defer dstClose()
-	dstExists := !os.IsNotExist(err)
-
-	dstStat, err := dstFile.Stat()
-	if err != nil && dstExists {
-		return "", false, err
-	}
-
-	if dstExists && dstStat.IsDir() { // oops, dst is a dir, and we want a file...
-		if !apply {
-			return "", false, nil
-		}
-		if !obj.Force {
-			return "", false, fmt.Errorf("Can't force dir into file: %s", dst)
-		}
-
-		cleanDst := path.Clean(dst)
-		if cleanDst == "" || cleanDst == "/" {
-			return "", false, fmt.Errorf("Don't want to remove root!") // safety
-		}
-		// FIXME: respect obj.Recurse here...
-		// there is a dir here, where we want a file...
-		log.Printf("fileCheckApply: Removing (force): %s", cleanDst)
-		if err := os.RemoveAll(cleanDst); err != nil { // dangerous ;)
-			return "", false, err
-		}
-		dstExists = false // now it's gone!
-
-	} else if err == nil {
-		if !dstStat.Mode().IsRegular() {
-			return "", false, fmt.Errorf("Non-regular dst file: %s (%q)", dstStat.Name(), dstStat.Mode())
-		}
-		if isFile && os.SameFile(srcStat, dstStat) { // same inode, we're done!
-			return "", true, nil
-		}
-	}
-
-	if dstExists { // if dst doesn't exist, no need to compare hashes
-		// hash comparison (efficient because we can cache hash of content str)
-		if sha256sum == "" { // cache is invalid
-			hash := sha256.New()
-			// TODO: file existence test?
-			if _, err := io.Copy(hash, src); err != nil {
-				return "", false, err
-			}
-			sha256sum = hex.EncodeToString(hash.Sum(nil))
-			// since we re-use this src handler below, it is
-			// *critical* to seek to 0, or we'll copy nothing!
-			if n, err := src.Seek(0, 0); err != nil || n != 0 {
-				return sha256sum, false, err
-			}
-		}
-
-		// dst hash
-		hash := sha256.New()
-		if _, err := io.Copy(hash, dstFile); err != nil {
-			return "", false, err
-		}
-		if h := hex.EncodeToString(hash.Sum(nil)); h == sha256sum {
-			return sha256sum, true, nil // same!
-		}
-	}
-
-	// state is not okay, no work done, exit, but without error
-	if !apply {
-		return sha256sum, false, nil
-	}
-	if obj.debug {
-		log.Printf("fileCheckApply: Apply: %s -> %s", src, dst)
-	}
-
-	dstClose() // unlock file usage so we can write to it
-	dstFile, err = os.Create(dst)
-	if err != nil {
-		return sha256sum, false, err
-	}
-	defer dstFile.Close() // TODO: is this redundant because of the earlier defered Close() ?
-
-	if isFile { // set mode because it's a new file
-		if err := dstFile.Chmod(srcStat.Mode()); err != nil {
-			return sha256sum, false, err
-		}
-	}
-
-	// TODO: attempt to reflink with Splice() and int(file.Fd()) as input...
-	// syscall.Splice(rfd int, roff *int64, wfd int, woff *int64, len int, flags int) (n int64, err error)
-
-	// TODO: should we offer a way to cancel the copy on ^C ?
-	if obj.debug {
-		log.Printf("fileCheckApply: Copy: %s -> %s", src, dst)
-	}
-	if n, err := io.Copy(dstFile, src); err != nil {
-		return sha256sum, false, err
-	} else if obj.debug {
-		log.Printf("fileCheckApply: Copied: %v", n)
-	}
-	return sha256sum, false, dstFile.Sync()
-}
-
-// syncCheckApply is the CheckApply operation for a source and destination dir.
-// It is recursive and can create directories directly, and files via the usual
-// fileCheckApply method. It returns checkOK and error as is normally expected.
-func (obj *NetRes) syncCheckApply(apply bool, src, dst string) (bool, error) {
-	if obj.debug {
-		log.Printf("syncCheckApply: %s -> %s", src, dst)
-	}
-	if src == "" || dst == "" {
-		return false, fmt.Errorf("The src and dst must not be empty!")
-	}
-
-	var checkOK = true
-	// TODO: handle ./ cases or ../ cases that need cleaning ?
-
-	srcIsDir := strings.HasSuffix(src, "/")
-	dstIsDir := strings.HasSuffix(dst, "/")
-
-	if srcIsDir != dstIsDir {
-		return false, fmt.Errorf("The src and dst must be both either files or directories.")
-	}
-
-	if !srcIsDir && !dstIsDir {
-		if obj.debug {
-			log.Printf("syncCheckApply: %s -> %s", src, dst)
-		}
-		fin, err := os.Open(src)
-		if err != nil {
-			if obj.debug && os.IsNotExist(err) { // if we get passed an empty src
-				log.Printf("syncCheckApply: Missing src: %s", src)
-			}
-			return false, err
-		}
-
-		_, checkOK, err := obj.fileCheckApply(apply, fin, dst, "")
-		if err != nil {
-			fin.Close()
-			return false, err
-		}
-		return checkOK, fin.Close()
-	}
-
-	// else: if srcIsDir && dstIsDir
-	srcFiles, err := ReadDir(src)          // if src does not exist...
-	if err != nil && !os.IsNotExist(err) { // an empty map comes out below!
-		return false, err
-	}
-	dstFiles, err := ReadDir(dst)
-	if err != nil && !os.IsNotExist(err) {
-		return false, err
-	}
-	//log.Printf("syncCheckApply: srcFiles: %v", srcFiles)
-	//log.Printf("syncCheckApply: dstFiles: %v", dstFiles)
-	smartSrc := mapPaths(srcFiles)
-	smartDst := mapPaths(dstFiles)
-
-	for relPath, fileInfo := range smartSrc {
-		absSrc := fileInfo.AbsPath // absolute path
-		absDst := dst + relPath    // absolute dest
-
-		if _, exists := smartDst[relPath]; !exists {
-			if fileInfo.IsDir() {
-				if !apply { // only checking and not identical!
-					return false, nil
-				}
-
-				// file exists, but we want a dir: we need force
-				// we check for the file w/o the smart dir slash
-				relPathFile := strings.TrimSuffix(relPath, "/")
-				if _, ok := smartDst[relPathFile]; ok {
-					absCleanDst := path.Clean(absDst)
-					if !obj.Force {
-						return false, fmt.Errorf("Can't force file into dir: %s", absCleanDst)
-					}
-					if absCleanDst == "" || absCleanDst == "/" {
-						return false, fmt.Errorf("Don't want to remove root!") // safety
-					}
-					log.Printf("syncCheckApply: Removing (force): %s", absCleanDst)
-					if err := os.Remove(absCleanDst); err != nil {
-						return false, err
-					}
-					delete(smartDst, relPathFile) // rm from purge list
-				}
-
-				if obj.debug {
-					log.Printf("syncCheckApply: mkdir -m %s '%s'", fileInfo.Mode(), absDst)
-				}
-				if err := os.Mkdir(absDst, fileInfo.Mode()); err != nil {
-					return false, err
-				}
-				checkOK = false // we did some work
-			}
-			// if we're a regular file, the recurse will create it
-		}
-
-		if obj.debug {
-			log.Printf("syncCheckApply: Recurse: %s -> %s", absSrc, absDst)
-		}
-		if obj.Recurse {
-			if c, err := obj.syncCheckApply(apply, absSrc, absDst); err != nil { // recurse
-				return false, errwrap.Wrapf(err, "syncCheckApply: Recurse failed")
-			} else if !c { // don't let subsequent passes make this true
-				checkOK = false
-			}
-		}
-		if !apply && !checkOK { // check failed, and no apply to do, so exit!
-			return false, nil
-		}
-		delete(smartDst, relPath) // rm from purge list
-	}
-
-	if !apply && len(smartDst) > 0 { // we know there are files to remove!
-		return false, nil // so just exit now
-	}
-	// any files that now remain in smartDst need to be removed...
-	for relPath, fileInfo := range smartDst {
-		absSrc := src + relPath    // absolute dest (should not exist!)
-		absDst := fileInfo.AbsPath // absolute path (should get removed)
-		absCleanDst := path.Clean(absDst)
-		if absCleanDst == "" || absCleanDst == "/" {
-			return false, fmt.Errorf("Don't want to remove root!") // safety
-		}
-
-		// FIXME: respect obj.Recurse here...
-
-		// NOTE: we could use os.RemoveAll instead of recursing, but I
-		// think the symmetry is more elegant and correct here for now
-		// Avoiding this is also useful if we had a recurse limit arg!
-		if true { // switch
-			log.Printf("syncCheckApply: Removing: %s", absCleanDst)
-			if apply {
-				if err := os.RemoveAll(absCleanDst); err != nil { // dangerous ;)
-					return false, err
-				}
-				checkOK = false
-			}
-			continue
-		}
-		_ = absSrc
-		//log.Printf("syncCheckApply: Recurse rm: %s -> %s", absSrc, absDst)
-		//if c, err := obj.syncCheckApply(apply, absSrc, absDst); err != nil {
-		//	return false, errwrap.Wrapf(err, "syncCheckApply: Recurse rm failed")
-		//} else if !c { // don't let subsequent passes make this true
-		//	checkOK = false
-		//}
-		//log.Printf("syncCheckApply: Removing: %s", absCleanDst)
-		//if apply { // safety
-		//	if err := os.Remove(absCleanDst); err != nil {
-		//		return false, err
-		//	}
-		//	checkOK = false
-		//}
-	}
-
-	return checkOK, nil
-}
-
-// contentCheckApply performs a CheckApply for the file existence and content.
-func (obj *NetRes) contentCheckApply(apply bool) (checkOK bool, _ error) {
-	log.Printf("%s[%s]: contentCheckApply(%t)", obj.Kind(), obj.GetName(), apply)
-
-	if obj.State == "absent" {
-		if _, err := os.Stat(obj.path); os.IsNotExist(err) {
-			// no such file or directory, but
-			// file should be missing, phew :)
-			return true, nil
-
-		} else if err != nil { // what could this error be?
-			return false, err
-		}
-
-		// state is not okay, no work done, exit, but without error
-		if !apply {
-			return false, nil
-		}
-
-		log.Printf("contentCheckApply: Removing: %s", obj.path)
-		err := os.RemoveAll(obj.path)
-		return false, err // either nil or not
-	}
-
-	// content is not defined, leave it alone...
-	if obj.Content == nil {
-		return true, nil
-	}
-
-	checkOK, err := obj.syncCheckApply(apply, obj.Source, obj.path)
-	if err != nil {
-		log.Printf("syncCheckApply: Error: %v", err)
-		return false, err
-	}
-
-	return checkOK, nil
-}
-
 // CheckApply checks the resource state and applies the resource if the bool
 // input is true. It returns error info and if the state check passed or not.
 func (obj *NetRes) CheckApply(apply bool) (checkOK bool, _ error) {
@@ -614,13 +273,6 @@ func (obj *NetRes) CheckApply(apply bool) (checkOK bool, _ error) {
 	}
 
 	checkOK = true
-
-	// Check content
-	if c, err := obj.contentCheckApply(apply); err != nil {
-		return false, err
-	} else if !c {
-		checkOK = false
-	}
 
 	// if we did work successfully, or are in a good state, then state is ok
 	if apply || checkOK {
@@ -740,26 +392,21 @@ func (obj *NetRes) Compare(res Res) bool {
 		if obj.Name != res.Name {
 			return false
 		}
-		if obj.path != res.Path {
-			return false
-		}
-		if (obj.Content == nil) != (res.Content == nil) { // xor
-			return false
-		}
-		if obj.Content != nil && res.Content != nil {
-			if *obj.Content != *res.Content { // compare the strings
-				return false
-			}
-		}
-		if obj.Source != res.Source {
-			return false
-		}
-		if obj.State != res.State {
-			return false
-		}
-		if obj.Recurse != res.Recurse {
-			return false
-		}
+
+		// Check all sections for equality
+		/*
+		  Match      MatchSection      `yaml:"match"`
+		  Link       LinkSection       `yaml:"link"`
+		  Address    AddressSection    `yaml:"address"`
+		  Route      RouteSection      `yaml:"route"`
+		  DHCP       DHCPSection       `yaml:"dhcp"`
+		  IPv6       IPv6Section       `yaml:"ipv6"`
+		  DHCPServer DHCPServerSection `yaml:"dhcp_server"`
+		  Bridge     BridgeSection     `yaml:"bridge"`
+		  BridgeFDB  BridgeFDBSection  `yaml:"bridge_fdb"`
+		  BridgeVLAN BridgeVLANSection `yaml:"bridge_vlan"`
+		*/
+
 		if obj.Force != res.Force {
 			return false
 		}
@@ -767,10 +414,4 @@ func (obj *NetRes) Compare(res Res) bool {
 		return false
 	}
 	return true
-}
-
-// CollectPattern applies the pattern for collection resources.
-func (obj *NetRes) CollectPattern(pattern string) {
-	// XXX: currently the pattern for files can only override the Dirname variable :P
-	obj.Dirname = pattern // XXX: simplistic for now
 }
